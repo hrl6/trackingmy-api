@@ -1,0 +1,16 @@
+# .gitignore
+
+# Configuration with sensitive data
+/config/config.php
+
+# Logs
+/logs/
+
+# Composer dependencies
+/vendor/
+
+# Temporary files
+.env
+*.log
+.DS_Store
+Thumbs.db
