@@ -1,5 +1,4 @@
 <?php
-// public/webhook.php
 
 // Include configuration
 $config = require_once __DIR__ . '/../config/config.php';
@@ -7,8 +6,15 @@ $config = require_once __DIR__ . '/../config/config.php';
 // Get the raw POST data
 $rawPostData = file_get_contents("php://input");
 
-// Get the signature from headers
-$signature = isset($_SERVER['HTTP_TRACKING_HMAC_SHA256']) ? $_SERVER['HTTP_TRACKING_HMAC_SHA256'] : '';
+// Get the signature from headers (try different header formats)
+$signature = '';
+$headers = getallheaders();
+foreach ($headers as $name => $value) {
+    if (strtolower($name) === 'tracking-hmac-sha256') {
+        $signature = $value;
+        break;
+    }
+}
 
 // Check if this is a browser request (GET with no payload)
 $isBrowserRequest = empty($rawPostData) && $_SERVER['REQUEST_METHOD'] === 'GET';
@@ -34,8 +40,9 @@ if (!is_dir($logDir)) {
 $logData = [
     'time' => date('Y-m-d H:i:s'),
     'method' => $_SERVER['REQUEST_METHOD'],
-    'headers' => getallheaders(),
-    'payload' => json_decode($rawPostData, true)
+    'headers' => $headers,
+    'payload' => json_decode($rawPostData, true),
+    'signature_received' => $signature
 ];
 
 file_put_contents(
@@ -44,22 +51,15 @@ file_put_contents(
     FILE_APPEND
 );
 
-// If this is a POST request with payload but no signature, log the issue
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($rawPostData) && empty($signature)) {
-    file_put_contents(
-        $logDir . '/missing_signature_' . date('Y-m-d') . '.log',
-        "Received POST without signature header\nPayload: " . $rawPostData . "\n" . str_repeat('-', 50) . PHP_EOL,
-        FILE_APPEND
-    );
-    
-    http_response_code(401);
-    echo json_encode(['error' => 'Missing signature header']);
+// Only process POST requests with payload
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || empty($rawPostData)) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Invalid request']);
     exit;
 }
 
-// Only verify signature for non-browser requests with payload
-if (!empty($rawPostData)) {
-    // Verify the signature
+// Verify the signature if secret key is provided
+if (!empty($secretKey)) {
     $calculatedSignature = base64_encode(hash_hmac('sha256', $rawPostData, $secretKey, true));
     
     // Log signature verification details for debugging
@@ -69,54 +69,229 @@ if (!empty($rawPostData)) {
         "Secret Key: " . $secretKey . "\n" .
         "Expected: " . $calculatedSignature . "\n" .
         "Received: " . $signature . "\n" . 
+        "Match: " . (hash_equals($calculatedSignature, $signature) ? 'YES' : 'NO') . "\n" .
         str_repeat('-', 50) . PHP_EOL,
         FILE_APPEND
     );
 
     // Check if signatures match (only if signature is present)
-    if (!empty($signature) && hash_equals($calculatedSignature, $signature)) {
-        // Parse the webhook payload
-        $payload = json_decode($rawPostData, true);
-        
-        // Process the events
-        if (isset($payload['events']) && is_array($payload['events'])) {
-            foreach ($payload['events'] as $event) {
-                // Handle different event types
-                switch ($event['event']) {
-                    case 'trackings/create':
-                        // Handle tracking creation
-                        logEvent('Tracking created', $event);
-                        break;
-                    
-                    case 'trackings/update':
-                        // Handle tracking update
-                        logEvent('Tracking updated', $event);
-                        break;
-                    
-                    case 'trackings/checkpoint_update':
-                        // Handle checkpoint update
-                        logEvent('Checkpoint updated', $event);
-                        break;
-                    
-                    // Add more event handlers as needed
-                    default:
-                        logEvent('Unknown event: ' . $event['event'], $event);
-                }
-            }
-        }
-        
-        // Return a success response
-        http_response_code(200);
-        echo json_encode(['success' => true]);
-    } else {
-        // Signature verification failed
+    if (!empty($signature) && !hash_equals($calculatedSignature, $signature)) {
         http_response_code(401);
         echo json_encode(['error' => 'Invalid signature']);
+        exit;
     }
-} else {
-    // No payload
+}
+
+// Parse the webhook payload
+$payload = json_decode($rawPostData, true);
+
+if (json_last_error() !== JSON_ERROR_NONE) {
     http_response_code(400);
-    echo json_encode(['error' => 'No payload received']);
+    echo json_encode(['error' => 'Invalid JSON']);
+    exit;
+}
+
+// Handle different webhook versions
+if (isset($payload['events']) && is_array($payload['events'])) {
+    // Webhook v2 format
+    foreach ($payload['events'] as $event) {
+        processEventV2($event);
+    }
+} elseif (isset($payload['event'])) {
+    // Webhook v1 format
+    processEventV1($payload);
+} else {
+    logEvent('Unknown webhook format', $payload);
+}
+
+// Return a success response
+http_response_code(200);
+echo json_encode(['success' => true]);
+
+/**
+ * Process v2 webhook events
+ */
+function processEventV2($event) {
+    if (!isset($event['event'])) {
+        logEvent('V2 Event type not found', $event);
+        return;
+    }
+    
+    switch ($event['event']) {
+        case 'trackings/create':
+            handleTrackingCreateV2($event);
+            break;
+        case 'trackings/update':
+            handleTrackingUpdateV2($event);
+            break;
+        case 'trackings/checkpoint_update':
+            handleCheckpointUpdateV2($event);
+            break;
+        case 'trackings/delete':
+            handleTrackingDeleteV2($event);
+            break;
+        case 'shipments/create':
+            handleShipmentCreateV2($event);
+            break;
+        case 'shipments/update':
+            handleShipmentUpdateV2($event);
+            break;
+        case 'shipments/delete':
+            handleShipmentDeleteV2($event);
+            break;
+        case 'shipments/cancel':
+            handleShipmentCancelV2($event);
+            break;
+        case 'shipments/generated':
+            handleShipmentGeneratedV2($event);
+            break;
+        default:
+            logEvent('Unknown V2 event type: ' . $event['event'], $event);
+    }
+}
+
+/**
+ * Process v1 webhook events
+ */
+function processEventV1($payload) {
+    if (!isset($payload['event'])) {
+        logEvent('V1 Event type not found', $payload);
+        return;
+    }
+    
+    switch ($payload['event']) {
+        case 'tracking_create':
+            handleTrackingCreateV1($payload);
+            break;
+        case 'tracking_update':
+            handleTrackingUpdateV1($payload);
+            break;
+        case 'tracking_checkpoint_update':
+            handleCheckpointUpdateV1($payload);
+            break;
+        case 'tracking_delete':
+            handleTrackingDeleteV1($payload);
+            break;
+        case 'shipment_create':
+            handleShipmentCreateV1($payload);
+            break;
+        case 'shipment_update':
+            handleShipmentUpdateV1($payload);
+            break;
+        case 'shipment_delete':
+            handleShipmentDeleteV1($payload);
+            break;
+        case 'shipment_cancel':
+            handleShipmentCancelV1($payload);
+            break;
+        case 'shipment_generated':
+            handleShipmentGeneratedV1($payload);
+            break;
+        default:
+            logEvent('Unknown V1 event type: ' . $payload['event'], $payload);
+    }
+}
+
+// V2 Event Handlers
+function handleTrackingCreateV2($event) {
+    $tracking = $event['tracking'];
+    logEvent('V2 Tracking created: ' . $tracking['tracking_number'], $tracking);
+}
+
+function handleTrackingUpdateV2($event) {
+    $tracking = $event['tracking'];
+    logEvent('V2 Tracking updated: ' . $tracking['tracking_number'], $tracking);
+}
+
+function handleCheckpointUpdateV2($event) {
+    $tracking = $event['tracking'];
+    logEvent('V2 Checkpoint updated: ' . $tracking['tracking_number'], $tracking);
+    
+    if (isset($tracking['latest_checkpoint'])) {
+        $checkpoint = $tracking['latest_checkpoint'];
+        logEvent('V2 Latest checkpoint: ' . $checkpoint['status'] . ' at ' . $checkpoint['location'], $checkpoint);
+    }
+}
+
+function handleTrackingDeleteV2($event) {
+    $tracking = $event['tracking'];
+    logEvent('V2 Tracking deleted: ' . $tracking['tracking_number'], $tracking);
+}
+
+function handleShipmentCreateV2($event) {
+    $shipment = $event['shipment'];
+    logEvent('V2 Shipment created: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentUpdateV2($event) {
+    $shipment = $event['shipment'];
+    logEvent('V2 Shipment updated: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentDeleteV2($event) {
+    $shipment = $event['shipment'];
+    logEvent('V2 Shipment deleted: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentCancelV2($event) {
+    $shipment = $event['shipment'];
+    logEvent('V2 Shipment cancelled: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentGeneratedV2($event) {
+    $shipment = $event['shipment'];
+    logEvent('V2 Shipment generated: ' . $shipment['order_number'], $shipment);
+}
+
+// V1 Event Handlers
+function handleTrackingCreateV1($payload) {
+    $tracking = $payload['tracking'];
+    logEvent('V1 Tracking created: ' . $tracking['tracking_number'], $tracking);
+}
+
+function handleTrackingUpdateV1($payload) {
+    $tracking = $payload['tracking'];
+    logEvent('V1 Tracking updated: ' . $tracking['tracking_number'], $tracking);
+}
+
+function handleCheckpointUpdateV1($payload) {
+    $tracking = $payload['tracking'];
+    logEvent('V1 Checkpoint updated: ' . $tracking['tracking_number'], $tracking);
+    
+    if (isset($tracking['checkpoints']) && !empty($tracking['checkpoints'])) {
+        $latestCheckpoint = $tracking['checkpoints'][0]; // First checkpoint is usually the latest
+        logEvent('V1 Latest checkpoint: ' . $latestCheckpoint['status'] . ' at ' . $latestCheckpoint['location'], $latestCheckpoint);
+    }
+}
+
+function handleTrackingDeleteV1($payload) {
+    $tracking = $payload['tracking'];
+    logEvent('V1 Tracking deleted: ' . $tracking['tracking_number'], $tracking);
+}
+
+function handleShipmentCreateV1($payload) {
+    $shipment = $payload['shipment'];
+    logEvent('V1 Shipment created: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentUpdateV1($payload) {
+    $shipment = $payload['shipment'];
+    logEvent('V1 Shipment updated: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentDeleteV1($payload) {
+    $shipment = $payload['shipment'];
+    logEvent('V1 Shipment deleted: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentCancelV1($payload) {
+    $shipment = $payload['shipment'];
+    logEvent('V1 Shipment cancelled: ' . $shipment['order_number'], $shipment);
+}
+
+function handleShipmentGeneratedV1($payload) {
+    $shipment = $payload['shipment'];
+    logEvent('V1 Shipment generated: ' . $shipment['order_number'], $shipment);
 }
 
 // Simple logging function

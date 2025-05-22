@@ -3,7 +3,8 @@
 class TrackingClient
 {
     private $apiKey;
-    private $baseUrl = 'https://seller.tracking.my/api/v2';
+    private $baseUrlV1 = 'https://seller.tracking.my/api/v1';
+    private $baseUrlV2 = 'https://seller.tracking.my/api/v2';
     private $verifySsl = true;
     
     public function __construct($apiKey, $verifySsl = true)
@@ -13,42 +14,39 @@ class TrackingClient
     }
     
     /**
-     * Get all trackings
+     * Get all trackings (v1)
      */
     public function getTrackings()
     {
-        return $this->request('GET', '/trackings');
+        return $this->request('GET', '/trackings', null, 'v1');
     }
     
     /**
-     * Create a tracking (use the correct method based on API error)
-     * Let's try using GET with query parameters instead of POST with JSON body
+     * Create a tracking (v1 - uses POST with JSON body)
      */
     public function createTracking($trackingData)
     {
-        // Convert tracking data to query string
-        $queryString = http_build_query($trackingData);
-        return $this->request('GET', '/trackings/create?' . $queryString);
+        return $this->request('POST', '/trackings', $trackingData, 'v1');
     }
     
     /**
-     * Get tracking information
+     * Get specific tracking information (v1)
      */
     public function getTracking($courier, $trackingNumber)
     {
-        return $this->request('GET', "/trackings/{$courier}/{$trackingNumber}");
+        return $this->request('GET', "/trackings/{$courier}/{$trackingNumber}", null, 'v1');
     }
     
     /**
-     * Delete a tracking
+     * Delete a tracking (v1)
      */
     public function deleteTracking($courier, $trackingNumber)
     {
-        return $this->request('DELETE', "/trackings/{$courier}/{$trackingNumber}");
+        return $this->request('DELETE', "/trackings/{$courier}/{$trackingNumber}", null, 'v1');
     }
     
     /**
-     * Register webhook
+     * Register webhook (v2)
      */
     public function registerWebhook($url, $events, $secretKey)
     {
@@ -58,31 +56,32 @@ class TrackingClient
             'secret_key' => $secretKey
         ];
         
-        return $this->request('PUT', '/webhook', $data);
+        return $this->request('PUT', '/webhook', $data, 'v2');
     }
     
     /**
-     * Get webhook configuration
+     * Get webhook configuration (v2)
      */
     public function getWebhookConfig()
     {
-        return $this->request('GET', '/webhook');
+        return $this->request('GET', '/webhook', null, 'v2');
     }
     
     /**
-     * Get list of supported couriers
+     * Get list of supported couriers (v1)
      */
     public function getCouriers()
     {
-        return $this->request('GET', '/couriers');
+        return $this->request('GET', '/couriers', null, 'v1');
     }
     
     /**
      * Send request to the API
      */
-    private function request($method, $endpoint, $data = null)
+    private function request($method, $endpoint, $data = null, $version = 'v1')
     {
-        $url = $this->baseUrl . $endpoint;
+        $baseUrl = ($version === 'v2') ? $this->baseUrlV2 : $this->baseUrlV1;
+        $url = $baseUrl . $endpoint;
         
         // For GET requests with data, append as query parameters
         if ($method === 'GET' && $data !== null && !strpos($endpoint, '?')) {
@@ -107,7 +106,6 @@ class TrackingClient
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_SSL_VERIFYPEER => $this->verifySsl,
             CURLOPT_SSL_VERIFYHOST => $this->verifySsl ? 2 : 0,
-            CURLOPT_VERBOSE => true // Enable verbose output for debugging
         ];
         
         if ($data !== null && in_array($method, ['POST', 'PUT'])) {
@@ -116,24 +114,14 @@ class TrackingClient
         
         curl_setopt_array($ch, $options);
         
-        // Create a file to store verbose information
-        $verbose = fopen('php://temp', 'w+');
-        curl_setopt($ch, CURLOPT_STDERR, $verbose);
-        
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         
         if (curl_errno($ch)) {
-            rewind($verbose);
-            $verboseLog = stream_get_contents($verbose);
-            fclose($verbose);
-            
-            throw new \Exception('cURL error: ' . curl_error($ch) . "\nVerbose log: " . $verboseLog);
+            $error = curl_error($ch);
+            curl_close($ch);
+            throw new \Exception('cURL error: ' . $error);
         }
-        
-        rewind($verbose);
-        $verboseLog = stream_get_contents($verbose);
-        fclose($verbose);
         
         curl_close($ch);
         
@@ -142,8 +130,7 @@ class TrackingClient
         return [
             'code' => $httpCode,
             'data' => $responseData,
-            'raw' => $response,
-            'verbose' => $verboseLog
+            'raw' => $response
         ];
     }
 }
